@@ -5,11 +5,11 @@
 //! error handling, and a CLI entry-point for end-to-end experimentation.
 
 use csv::ReaderBuilder;
-use ndarray::{s, Array1, Array2, ArrayView1, ArrayViewMut1, Axis};
+use ndarray::{Array1, Array2, ArrayView1, ArrayViewMut1, Axis};
 use ndarray_rand::rand_distr::{Distribution, Normal, Uniform};
 use ndarray_rand::RandomExt;
 use parquet::file::reader::{FileReader, SerializedFileReader};
-use parquet::record::{Field, Row, RowAccessor};
+use parquet::record::{Field, Row};
 use rand::prelude::*;
 use rand_chacha::ChaCha8Rng;
 use rayon::prelude::*;
@@ -221,11 +221,8 @@ impl KMeans {
 
         let zero = (vec![vec![0.0f64; dim]; k], vec![0usize; k]);
         let mut iterations = 0usize;
-        let mut converged = false;
-        let mut final_assignments = Vec::new();
-        let mut final_counts = vec![0usize; k];
 
-        loop {
+        let (final_assignments, final_counts, converged) = loop {
             iterations += 1;
 
             let assignments: Vec<usize> = (0..n)
@@ -281,12 +278,10 @@ impl KMeans {
             }
 
             if max_shift <= self.config.tol || iterations >= self.config.max_iter {
-                converged = max_shift <= self.config.tol;
-                final_assignments = assignments;
-                final_counts = counts;
-                break;
+                let converged = max_shift <= self.config.tol;
+                break (assignments, counts, converged);
             }
-        }
+        };
 
         let inertia = self.inertia_from_assignments(points, &final_assignments);
         FitOutcome {
@@ -321,7 +316,6 @@ pub fn kmeans_train_with_restarts(
     rng: &mut ChaCha8Rng,
 ) -> Result<KMeansRun> {
     config.validate(points)?;
-    let dim = points.ncols();
 
     let mut best_model: Option<KMeans> = None;
     let mut best_outcome: Option<FitOutcome> = None;
@@ -387,7 +381,7 @@ pub fn generate_clustered_points(
     let dim = centroids.ncols();
     let total = n_per_cluster * k;
     let mut points = Array2::zeros((total, dim));
-    let normal = rand_distr::Normal::new(0.0, spread).unwrap();
+    let normal = Normal::new(0.0, spread).unwrap();
 
     for (cluster_idx, centroid) in centroids.outer_iter().enumerate() {
         for sample_idx in 0..n_per_cluster {
@@ -571,7 +565,7 @@ impl DataLoader {
         let mut row_iter = reader.get_row_iter(None)?;
         let mut rows: Vec<Row> = Vec::new();
         while let Some(row) = row_iter.next() {
-            rows.push(row?);
+            rows.push(row);
         }
         if rows.is_empty() {
             return Ok(Array2::zeros((0, 0)));
@@ -579,16 +573,26 @@ impl DataLoader {
         let width = rows[0].len();
         let mut data = Array2::zeros((rows.len(), width));
 
-        for (i, row) in rows.into_iter().enumerate() {
-            for j in 0..width {
-                let value = match row.get(j) {
-                    Some(Field::Double(v)) => v,
-                    Some(Field::Float(v)) => v as f64,
-                    Some(Field::Int(v)) => v as f64,
-                    Some(Field::Long(v)) => v as f64,
-                    Some(Field::Short(v)) => v as f64,
-                    Some(Field::Byte(v)) => v as f64,
-                    Some(Field::Null) => {
+        for (i, row) in rows.iter().enumerate() {
+            if row.len() != width {
+                return Err(KMeansError::InvalidData(format!(
+                    "row {i} width mismatch: expected {width}, found {}",
+                    row.len()
+                )));
+            }
+            for (j, (_, field)) in row.get_column_iter().enumerate() {
+                let value = match field {
+                    Field::Double(v) => *v,
+                    Field::Float(v) => *v as f64,
+                    Field::Int(v) => *v as f64,
+                    Field::Long(v) => *v as f64,
+                    Field::Short(v) => *v as f64,
+                    Field::Byte(v) => *v as f64,
+                    Field::UInt(v) => *v as f64,
+                    Field::ULong(v) => *v as f64,
+                    Field::UShort(v) => *v as f64,
+                    Field::UByte(v) => *v as f64,
+                    Field::Null => {
                         return Err(KMeansError::InvalidData(format!(
                             "column {j} contained a NULL value which cannot be converted to f64"
                         )))
@@ -610,6 +614,7 @@ impl DataLoader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ndarray::s;
 
     #[test]
     fn kmeans_basic_training() {

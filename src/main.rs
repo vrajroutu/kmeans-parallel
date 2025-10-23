@@ -7,6 +7,7 @@ use clap::{Parser, ValueEnum};
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 use rayon::ThreadPoolBuilder;
+use serde_json::json;
 use tracing::{error, info};
 use tracing_subscriber::FmtSubscriber;
 
@@ -244,7 +245,7 @@ fn write_result(
         .collect();
     let cluster_sizes = run.outcome.cluster_sizes.clone();
 
-    let dump = kmeans_parallel::serde_json::json!({
+    let dump = json!({
         "k": run.model.centroids.nrows(),
         "dim": data.ncols(),
         "rows": data.nrows(),
@@ -267,13 +268,13 @@ fn write_result(
                 .format
                 .or_else(|| infer_format(path))
                 .unwrap_or(InputFormat::Csv);
-            kmeans_parallel::serde_json::json!({
+            json!({
                 "type": "file",
-                "path": path,
+                "path": path.display().to_string(),
                 "format": format!("{fmt:?}").to_lowercase(),
             })
         } else {
-            kmeans_parallel::serde_json::json!({
+            json!({
                 "type": "synthetic",
                 "points": args.points,
                 "dim": args.dim,
@@ -281,17 +282,14 @@ fn write_result(
         },
         "assignments_path": args.assignments.as_ref().map(|p| p.display().to_string()),
         "standardization": standardization.as_ref().map(|params| {
-            kmeans_parallel::serde_json::json!({
+            json!({
                 "mean": params.mean.to_vec(),
                 "std": params.std.to_vec(),
             })
         }),
     });
 
-    std::fs::write(
-        &args.output,
-        kmeans_parallel::serde_json::to_string_pretty(&dump)?,
-    )?;
+    std::fs::write(&args.output, serde_json::to_string_pretty(&dump)?)?;
     info!(path = ?args.output, "wrote clustering summary");
     Ok(())
 }

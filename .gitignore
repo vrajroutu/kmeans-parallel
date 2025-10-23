@@ -1,0 +1,15 @@
+# Build output
+/target
+
+# IDE/editor artifacts
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+
+# Generated output examples (optional)
+kmeans_result.json
+assignments.csv

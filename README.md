@@ -1,6 +1,6 @@
 # kmeans-parallel
 
-parallelised k-means clustering implemented in Rust. The crate provides:
+High-performance, parallelised k-means clustering implemented in Rust by **Vraj Routu**. The crate provides:
 
 - A reusable library with deterministic initialisation (`kmeans++` and random), restart handling, inertia tracking, cluster population metrics, and optional data standardisation helpers.
 - A CLI (`kmeans-parallel`) that can ingest CSV or Parquet datasets, generate synthetic data when no input is supplied, and emit rich JSON reports plus optional assignment CSVs.
