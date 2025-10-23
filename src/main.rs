@@ -12,8 +12,9 @@ use tracing::{error, info};
 use tracing_subscriber::FmtSubscriber;
 
 use kmeans_parallel::{
-    generate_points, kmeans_train_with_restarts, standardize, DataLoader, DataMatrix, InitStrategy,
-    KMeansConfig, KMeansRun, Result as KMeansResult, Standardization, StandardizedData,
+    generate_points, kmeans_train_with_restarts, standardize, AdaptiveSettings, DataLoader,
+    DataMatrix, InitStrategy, KMeansConfig, KMeansRun, Result as KMeansResult, Standardization,
+    StandardizedData, TrainingMode,
 };
 
 #[derive(Parser, Debug)]
@@ -68,6 +69,38 @@ struct Args {
     #[arg(long, default_value_t = 1e-6)]
     tol: f64,
 
+    /// Training execution mode
+    #[arg(long, value_enum, default_value = "full")]
+    mode: ModeArg,
+
+    /// Reservoir multiplier (k * factor) used for adaptive mode seeding
+    #[arg(long, default_value_t = 3.0)]
+    adaptive_reservoir_factor: f64,
+
+    /// Initial minibatch fraction (0,1] for adaptive mode
+    #[arg(long, default_value_t = 0.1)]
+    adaptive_initial_fraction: f64,
+
+    /// Maximum minibatch fraction (0,1] for adaptive mode
+    #[arg(long, default_value_t = 0.6)]
+    adaptive_max_fraction: f64,
+
+    /// Maximum batch growth multiplier per adaptive iteration
+    #[arg(long, default_value_t = 4.0)]
+    adaptive_batch_multiplier: f64,
+
+    /// Maximum number of adaptive minibatch iterations before polishing
+    #[arg(long, default_value_t = 25)]
+    adaptive_max_iters: usize,
+
+    /// Patience (iterations) once centroid shifts fall below the adaptive tolerance
+    #[arg(long, default_value_t = 3)]
+    adaptive_patience: usize,
+
+    /// Target centroid shift tolerance guiding adaptive minibatch sizing
+    #[arg(long, default_value_t = 1e-3)]
+    adaptive_batch_tol: f64,
+
     /// Save trained model JSON
     #[arg(long)]
     save_model: Option<PathBuf>,
@@ -89,6 +122,21 @@ struct Args {
 enum InputFormat {
     Csv,
     Parquet,
+}
+
+#[derive(Copy, Clone, Debug, ValueEnum)]
+enum ModeArg {
+    Full,
+    Adaptive,
+}
+
+impl From<ModeArg> for TrainingMode {
+    fn from(mode: ModeArg) -> TrainingMode {
+        match mode {
+            ModeArg::Full => TrainingMode::FullBatch,
+            ModeArg::Adaptive => TrainingMode::Adaptive,
+        }
+    }
 }
 
 fn main() {
@@ -128,12 +176,14 @@ fn run(args: Args) -> KMeansResult<()> {
         info!(threads, "configured rayon global thread pool");
     }
 
+    let mode: TrainingMode = args.mode.into();
     info!(
         k = args.k,
         n_init = args.n_init,
         tol = args.tol,
         max_iter = args.iterations,
         seed = args.seed,
+        mode = ?mode,
         "starting kmeans optimisation"
     );
 
@@ -154,13 +204,42 @@ fn run(args: Args) -> KMeansResult<()> {
         (raw_data, None)
     };
 
+    let adaptive_settings = if matches!(mode, TrainingMode::Adaptive) {
+        Some(AdaptiveSettings {
+            reservoir_factor: args.adaptive_reservoir_factor,
+            initial_batch_fraction: args.adaptive_initial_fraction,
+            max_batch_fraction: args.adaptive_max_fraction,
+            max_batch_multiplier: args.adaptive_batch_multiplier,
+            max_adaptive_iters: args.adaptive_max_iters,
+            patience: args.adaptive_patience,
+            convergence_tol: args.adaptive_batch_tol,
+        })
+    } else {
+        None
+    };
+
     let config = KMeansConfig {
         k: args.k,
         max_iter: args.iterations,
         tol: args.tol,
         init: args.init,
         n_init: args.n_init,
+        mode,
+        adaptive: adaptive_settings,
     };
+
+    if let Some(ref settings) = config.adaptive {
+        info!(
+            reservoir_factor = settings.reservoir_factor,
+            initial_fraction = settings.initial_batch_fraction,
+            max_fraction = settings.max_batch_fraction,
+            batch_multiplier = settings.max_batch_multiplier,
+            max_iters = settings.max_adaptive_iters,
+            patience = settings.patience,
+            batch_tol = settings.convergence_tol,
+            "adaptive settings resolved"
+        );
+    }
 
     let start = Instant::now();
     let run: KMeansRun = kmeans_train_with_restarts(&data, &config, &mut rng)?;
@@ -173,6 +252,19 @@ fn run(args: Args) -> KMeansResult<()> {
         "kmeans optimisation finished"
     );
     info!(?run.outcome.cluster_sizes, "cluster population counts");
+    if let Some(telemetry) = run.telemetry.as_ref() {
+        info!(mode = ?telemetry.mode, "training telemetry available");
+        if let Some(adaptive) = telemetry.adaptive.as_ref() {
+            info!(
+                reservoir = adaptive.reservoir_sample_size,
+                stage2_iters = adaptive.stage2_iterations,
+                stage2_last_batch = adaptive.stage2_last_batch_size,
+                stage2_updates = adaptive.stage2_total_updates,
+                stage3_iters = adaptive.stage3_iterations,
+                "adaptive telemetry summary"
+            );
+        }
+    }
 
     write_result(
         &args,
@@ -244,6 +336,10 @@ fn write_result(
         .map(|row| run.model.centroids.row(row).to_vec())
         .collect();
     let cluster_sizes = run.outcome.cluster_sizes.clone();
+    let telemetry_json = run
+        .telemetry
+        .as_ref()
+        .map(|tel| serde_json::to_value(tel).unwrap());
 
     let dump = json!({
         "k": run.model.centroids.nrows(),
@@ -254,6 +350,7 @@ fn write_result(
         "converged": run.outcome.converged,
         "cluster_sizes": cluster_sizes,
         "init": run.model.config.init,
+        "mode": run.model.config.mode,
         "seed": seed,
         "elapsed_seconds": elapsed_secs,
         "standardized": args.standardize,
@@ -287,6 +384,7 @@ fn write_result(
                 "std": params.std.to_vec(),
             })
         }),
+        "telemetry": telemetry_json,
     });
 
     std::fs::write(&args.output, serde_json::to_string_pretty(&dump)?)?;

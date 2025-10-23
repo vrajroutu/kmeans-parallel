@@ -1,0 +1,54 @@
+{
+  "k": 4,
+  "dim": 3,
+  "rows": 5000,
+  "iterations": 25,
+  "inertia": 592.908873952729,
+  "converged": true,
+  "cluster_sizes": [
+    1230,
+    1236,
+    1237,
+    1297
+  ],
+  "init": "k-means-plus-plus",
+  "mode": "full-batch",
+  "seed": 42,
+  "elapsed_seconds": 0.012393167,
+  "standardized": false,
+  "config": {
+    "max_iter": 50,
+    "tol": 1e-6,
+    "n_init": 1
+  },
+  "centroids": [
+    [
+      0.5052572683744821,
+      0.7484834267932318,
+      0.7703954926888105
+    ],
+    [
+      0.22093033022368783,
+      0.2724071957660182,
+      0.4531828441695516
+    ],
+    [
+      0.5196967554986994,
+      0.7417728782119332,
+      0.22740526966616376
+    ],
+    [
+      0.7617855280343643,
+      0.2540408624865268,
+      0.5446151766424769
+    ]
+  ],
+  "data_source": {
+    "type": "synthetic",
+    "points": 5000,
+    "dim": 3
+  },
+  "assignments_path": null,
+  "standardization": null,
+  "telemetry": null
+}

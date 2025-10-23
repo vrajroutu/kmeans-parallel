@@ -11,6 +11,7 @@ use ndarray_rand::RandomExt;
 use parquet::file::reader::{FileReader, SerializedFileReader};
 use parquet::record::{Field, Row};
 use rand::prelude::*;
+use rand::seq::index::sample;
 use rand_chacha::ChaCha8Rng;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -55,6 +56,102 @@ pub enum InitStrategy {
     KMeansPlusPlus,
 }
 
+/// Training execution mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum TrainingMode {
+    /// Classic full-batch Lloyd iterations.
+    #[default]
+    FullBatch,
+    /// Adaptive multiphase training with streaming seeding and minibatches.
+    Adaptive,
+}
+
+/// Settings that control the adaptive multiphase pipeline.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdaptiveSettings {
+    /// Factor applied to `k` to determine the reservoir sample size.
+    pub reservoir_factor: f64,
+    /// Fraction of the dataset used for the initial minibatch.
+    pub initial_batch_fraction: f64,
+    /// Maximum fraction of the dataset a minibatch may touch.
+    pub max_batch_fraction: f64,
+    /// Upper bound multiplier when expanding batch sizes.
+    pub max_batch_multiplier: f64,
+    /// Maximum number of adaptive minibatch iterations before polishing.
+    pub max_adaptive_iters: usize,
+    /// Number of consecutive low-shift iterations required before stopping stage 2.
+    pub patience: usize,
+    /// Target shift tolerance used to adapt batch sizes.
+    pub convergence_tol: f64,
+}
+
+impl Default for AdaptiveSettings {
+    fn default() -> Self {
+        Self {
+            reservoir_factor: 3.0,
+            initial_batch_fraction: 0.1,
+            max_batch_fraction: 0.6,
+            max_batch_multiplier: 4.0,
+            max_adaptive_iters: 25,
+            patience: 3,
+            convergence_tol: 1e-3,
+        }
+    }
+}
+
+impl AdaptiveSettings {
+    fn validate(&self, points: &DataMatrix) -> Result<()> {
+        if self.reservoir_factor < 1.0 {
+            return Err(KMeansError::InvalidConfig(
+                "adaptive.reservoir_factor must be >= 1.0".into(),
+            ));
+        }
+        if !(0.0 < self.initial_batch_fraction && self.initial_batch_fraction <= 1.0) {
+            return Err(KMeansError::InvalidConfig(
+                "adaptive.initial_batch_fraction must be in (0, 1]".into(),
+            ));
+        }
+        if !(0.0 < self.max_batch_fraction && self.max_batch_fraction <= 1.0) {
+            return Err(KMeansError::InvalidConfig(
+                "adaptive.max_batch_fraction must be in (0, 1]".into(),
+            ));
+        }
+        if self.max_batch_fraction < self.initial_batch_fraction {
+            return Err(KMeansError::InvalidConfig(
+                "adaptive.max_batch_fraction must be >= adaptive.initial_batch_fraction".into(),
+            ));
+        }
+        if self.max_batch_multiplier < 1.0 {
+            return Err(KMeansError::InvalidConfig(
+                "adaptive.max_batch_multiplier must be >= 1.0".into(),
+            ));
+        }
+        if self.max_adaptive_iters == 0 {
+            return Err(KMeansError::InvalidConfig(
+                "adaptive.max_adaptive_iters must be > 0".into(),
+            ));
+        }
+        if self.patience == 0 {
+            return Err(KMeansError::InvalidConfig(
+                "adaptive.patience must be > 0".into(),
+            ));
+        }
+        if self.convergence_tol <= 0.0 {
+            return Err(KMeansError::InvalidConfig(
+                "adaptive.convergence_tol must be > 0".into(),
+            ));
+        }
+        if points.nrows() < points.ncols() && self.initial_batch_fraction < 1.0 {
+            // Warn via validation to avoid zero-sized batches on tiny datasets.
+            tracing::debug!(
+                "adaptive initial fraction may be too small for very tall datasets; continuing"
+            );
+        }
+        Ok(())
+    }
+}
+
 impl Default for InitStrategy {
     fn default() -> Self {
         Self::KMeansPlusPlus
@@ -97,6 +194,10 @@ pub struct KMeansConfig {
     pub init: InitStrategy,
     /// Number of restarts (best run selected by inertia).
     pub n_init: usize,
+    /// Execution strategy controlling training behaviour.
+    pub mode: TrainingMode,
+    /// Optional tuning knobs for adaptive mode.
+    pub adaptive: Option<AdaptiveSettings>,
 }
 
 impl Default for KMeansConfig {
@@ -107,6 +208,8 @@ impl Default for KMeansConfig {
             tol: 1e-4,
             init: InitStrategy::default(),
             n_init: 1,
+            mode: TrainingMode::default(),
+            adaptive: None,
         }
     }
 }
@@ -141,7 +244,41 @@ impl KMeansConfig {
                 "n_init must be at least 1".into(),
             ));
         }
+        if let TrainingMode::Adaptive = self.mode {
+            let settings = self.adaptive_settings();
+            settings.validate(points)?;
+        }
         Ok(())
+    }
+
+    /// Resolve adaptive settings, applying conservative defaults.
+    pub fn adaptive_settings(&self) -> AdaptiveSettings {
+        let mut settings = self.adaptive.clone().unwrap_or_default();
+        if !settings.reservoir_factor.is_finite() || settings.reservoir_factor < 1.0 {
+            settings.reservoir_factor = 3.0;
+        }
+        if !settings.initial_batch_fraction.is_finite() || settings.initial_batch_fraction <= 0.0 {
+            settings.initial_batch_fraction = 0.1;
+        }
+        if !settings.max_batch_fraction.is_finite() || settings.max_batch_fraction <= 0.0 {
+            settings.max_batch_fraction = 0.6;
+        }
+        if settings.max_batch_fraction < settings.initial_batch_fraction {
+            settings.max_batch_fraction = settings.initial_batch_fraction;
+        }
+        if !settings.max_batch_multiplier.is_finite() || settings.max_batch_multiplier < 1.0 {
+            settings.max_batch_multiplier = 4.0;
+        }
+        if settings.max_adaptive_iters == 0 {
+            settings.max_adaptive_iters = 10;
+        }
+        if settings.patience == 0 {
+            settings.patience = 2;
+        }
+        if !settings.convergence_tol.is_finite() || settings.convergence_tol <= 0.0 {
+            settings.convergence_tol = (self.tol * 10.0).max(1e-6);
+        }
+        settings
     }
 }
 
@@ -309,6 +446,25 @@ pub struct FitOutcome {
     pub cluster_sizes: Vec<usize>,
 }
 
+/// Telemetry emitted by training procedures.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrainingTelemetry {
+    pub mode: TrainingMode,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub adaptive: Option<AdaptiveTelemetry>,
+}
+
+/// Detailed stats for adaptive multiphase training.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdaptiveTelemetry {
+    pub reservoir_sample_size: usize,
+    pub stage2_iterations: usize,
+    pub stage2_last_batch_size: usize,
+    pub stage2_final_shift: f64,
+    pub stage2_total_updates: usize,
+    pub stage3_iterations: usize,
+}
+
 /// Run k-means with multiple random restarts, tracking the best candidate.
 pub fn kmeans_train_with_restarts(
     points: &DataMatrix,
@@ -319,16 +475,65 @@ pub fn kmeans_train_with_restarts(
 
     let mut best_model: Option<KMeans> = None;
     let mut best_outcome: Option<FitOutcome> = None;
+    let mut best_telemetry: Option<TrainingTelemetry> = None;
 
     for restart_idx in 0..config.n_init {
         let mut restart_rng = ChaCha8Rng::seed_from_u64(rng.next_u64());
-        let centroids = match config.init {
-            InitStrategy::KMeansPlusPlus => kmeans_pp_init(points, config.k, &mut restart_rng)?,
-            InitStrategy::Random => random_init(points, config.k, &mut restart_rng),
+        let reservoir_size =
+            compute_reservoir_size(points.nrows(), config.k, &config.adaptive_settings());
+        let centroids = match config.mode {
+            TrainingMode::Adaptive => {
+                adaptive_initialise_centroids(points, config, reservoir_size, &mut restart_rng)?
+            }
+            TrainingMode::FullBatch => match config.init {
+                InitStrategy::KMeansPlusPlus => kmeans_pp_init(points, config.k, &mut restart_rng)?,
+                InitStrategy::Random => random_init(points, config.k, &mut restart_rng),
+            },
         };
 
         let mut model = KMeans::new(config.clone(), centroids);
-        let outcome = model.fit(points, &mut restart_rng);
+        let (outcome, telemetry) = match config.mode {
+            TrainingMode::FullBatch => {
+                let outcome = model.fit(points, &mut restart_rng);
+                (outcome, None)
+            }
+            TrainingMode::Adaptive => {
+                let settings = config.adaptive_settings();
+                tracing::info!(
+                    reservoir = reservoir_size,
+                    "adaptive stage1 reservoir sampling initialised"
+                );
+                let stage2_stats =
+                    adaptive_minibatch_refinement(&mut model, points, &settings, &mut restart_rng);
+                tracing::info!(
+                    iterations = stage2_stats.stage2_iterations,
+                    last_batch = stage2_stats.stage2_last_batch_size,
+                    shift = stage2_stats.stage2_final_shift,
+                    updates = stage2_stats.stage2_total_updates,
+                    "adaptive stage2 minibatch phase complete"
+                );
+                let mut telemetry = TrainingTelemetry {
+                    mode: TrainingMode::Adaptive,
+                    adaptive: Some(AdaptiveTelemetry {
+                        reservoir_sample_size: reservoir_size,
+                        stage2_iterations: stage2_stats.stage2_iterations,
+                        stage2_last_batch_size: stage2_stats.stage2_last_batch_size,
+                        stage2_final_shift: stage2_stats.stage2_final_shift,
+                        stage2_total_updates: stage2_stats.stage2_total_updates,
+                        stage3_iterations: 0,
+                    }),
+                };
+                let outcome = model.fit(points, &mut restart_rng);
+                tracing::info!(
+                    iterations = outcome.iterations,
+                    converged = outcome.converged,
+                    inertia = outcome.inertia,
+                    "adaptive stage3 full-batch polish complete"
+                );
+                telemetry.adaptive.as_mut().unwrap().stage3_iterations = outcome.iterations;
+                (outcome, Some(telemetry))
+            }
+        };
 
         let inertia = outcome.inertia;
         if best_outcome
@@ -345,11 +550,16 @@ pub fn kmeans_train_with_restarts(
             );
             best_model = Some(model);
             best_outcome = Some(outcome);
+            best_telemetry = telemetry;
         }
     }
 
     match (best_model, best_outcome) {
-        (Some(model), Some(outcome)) => Ok(KMeansRun { model, outcome }),
+        (Some(model), Some(outcome)) => Ok(KMeansRun {
+            model,
+            outcome,
+            telemetry: best_telemetry,
+        }),
         _ => Err(KMeansError::InvalidData(
             "failed to train k-means on the provided dataset".into(),
         )),
@@ -363,6 +573,16 @@ pub struct KMeansRun {
     pub model: KMeans,
     /// Diagnostics and assignments for the best run.
     pub outcome: FitOutcome,
+    /// Optional detailed telemetry describing how the model was trained.
+    pub telemetry: Option<TrainingTelemetry>,
+}
+
+#[derive(Debug, Clone)]
+struct AdaptiveStageStats {
+    stage2_iterations: usize,
+    stage2_last_batch_size: usize,
+    stage2_final_shift: f64,
+    stage2_total_updates: usize,
 }
 
 /// Generate random data matrix (n rows, dim columns) using a reproducible RNG.
@@ -453,6 +673,136 @@ fn random_init(points: &DataMatrix, k: usize, rng: &mut ChaCha8Rng) -> DataMatri
         centroids.row_mut(ci).assign(&points.row(i));
     }
     centroids
+}
+
+fn compute_reservoir_size(n: usize, k: usize, settings: &AdaptiveSettings) -> usize {
+    let desired = (k as f64 * settings.reservoir_factor).ceil() as usize;
+    desired.clamp(k, n.max(1))
+}
+
+fn adaptive_initialise_centroids(
+    points: &DataMatrix,
+    config: &KMeansConfig,
+    reservoir_size: usize,
+    rng: &mut ChaCha8Rng,
+) -> Result<DataMatrix> {
+    let sample = reservoir_sample(points, reservoir_size, rng);
+    match config.init {
+        InitStrategy::KMeansPlusPlus => kmeans_pp_init(&sample, config.k, rng),
+        InitStrategy::Random => Ok(random_init(&sample, config.k, rng)),
+    }
+}
+
+fn reservoir_sample(points: &DataMatrix, sample_size: usize, rng: &mut ChaCha8Rng) -> DataMatrix {
+    let (n, dim) = (points.nrows(), points.ncols());
+    if sample_size >= n {
+        return points.clone();
+    }
+    let mut sample: Vec<Array1<f64>> = Vec::with_capacity(sample_size);
+    for i in 0..sample_size {
+        sample.push(points.row(i).to_owned());
+    }
+    for i in sample_size..n {
+        let j = rng.gen_range(0..=i);
+        if j < sample_size {
+            sample[j] = points.row(i).to_owned();
+        }
+    }
+    let mut arr = Array2::zeros((sample_size, dim));
+    for (i, row) in sample.into_iter().enumerate() {
+        arr.row_mut(i).assign(&row);
+    }
+    arr
+}
+
+fn adaptive_minibatch_refinement(
+    model: &mut KMeans,
+    points: &DataMatrix,
+    settings: &AdaptiveSettings,
+    rng: &mut ChaCha8Rng,
+) -> AdaptiveStageStats {
+    let n = points.nrows();
+    let k = model.centroids.nrows();
+    let mut counts = vec![0usize; k];
+    let mut prev_shift = f64::INFINITY;
+    let mut patience = 0usize;
+    let mut last_batch_size = 0usize;
+    let mut total_updates = 0usize;
+
+    for iteration in 0..settings.max_adaptive_iters {
+        let batch_size =
+            compute_batch_size(prev_shift, settings, n, k, model.config.tol.max(1e-12));
+        last_batch_size = batch_size;
+        let indices = sample_batch_indices(n, batch_size, rng);
+        let mut max_shift = 0.0;
+
+        for idx in indices {
+            total_updates += 1;
+            let point = points.row(idx);
+            let cid = model.predict_point(&point);
+            counts[cid] += 1;
+            let eta = 1.0 / counts[cid] as f64;
+            let mut centroid = model.centroids.row_mut(cid);
+            for (coord, &value) in centroid.iter_mut().zip(point.iter()) {
+                let old = *coord;
+                let new_val = old + eta * (value - old);
+                let shift = (new_val - old).abs();
+                if shift > max_shift {
+                    max_shift = shift;
+                }
+                *coord = new_val;
+            }
+        }
+
+        if max_shift <= settings.convergence_tol {
+            patience += 1;
+            if patience >= settings.patience {
+                return AdaptiveStageStats {
+                    stage2_iterations: iteration + 1,
+                    stage2_last_batch_size: last_batch_size,
+                    stage2_final_shift: max_shift,
+                    stage2_total_updates: total_updates,
+                };
+            }
+        } else {
+            patience = 0;
+        }
+        prev_shift = max_shift;
+    }
+
+    AdaptiveStageStats {
+        stage2_iterations: settings.max_adaptive_iters,
+        stage2_last_batch_size: last_batch_size,
+        stage2_final_shift: prev_shift,
+        stage2_total_updates: total_updates,
+    }
+}
+
+fn compute_batch_size(
+    prev_shift: f64,
+    settings: &AdaptiveSettings,
+    n: usize,
+    k: usize,
+    tol: f64,
+) -> usize {
+    let base = ((n as f64) * settings.initial_batch_fraction).round() as usize;
+    let base = base.max(k).max(1);
+    if !prev_shift.is_finite() {
+        return base.min(n);
+    }
+    let ratio = (prev_shift / tol.max(1e-12))
+        .clamp(0.5, settings.max_batch_multiplier)
+        .max(0.25);
+    let candidate = ((base as f64) * ratio).round() as usize;
+    let max_allowed = ((n as f64) * settings.max_batch_fraction).ceil() as usize;
+    candidate.max(base).min(max_allowed.max(base)).min(n).max(1)
+}
+
+fn sample_batch_indices(n: usize, batch_size: usize, rng: &mut ChaCha8Rng) -> Vec<usize> {
+    if batch_size >= n {
+        return (0..n).collect();
+    }
+    sample(rng, n, batch_size).into_vec()
 }
 
 fn squared_distance(a: &ArrayView1<f64>, b: &ArrayView1<f64>) -> f64 {
@@ -625,6 +975,7 @@ mod tests {
             tol: 1e-6,
             init: InitStrategy::KMeansPlusPlus,
             n_init: 2,
+            ..KMeansConfig::default()
         };
         let run =
             kmeans_train_with_restarts(&points, &config, &mut rng).expect("training succeeds");
@@ -670,5 +1021,35 @@ mod tests {
             assert!((variance - 1.0).abs() < 1e-6);
             assert!(params.std[col] >= 0.0);
         }
+    }
+
+    #[test]
+    fn adaptive_training_executes() {
+        let mut rng = ChaCha8Rng::seed_from_u64(9);
+        let points = generate_points(512, 6, &mut rng);
+        let mut config = KMeansConfig {
+            k: 6,
+            max_iter: 60,
+            tol: 1e-5,
+            init: InitStrategy::KMeansPlusPlus,
+            n_init: 1,
+            ..KMeansConfig::default()
+        };
+        config.mode = TrainingMode::Adaptive;
+        config.adaptive = Some(AdaptiveSettings {
+            initial_batch_fraction: 0.2,
+            max_batch_fraction: 0.8,
+            convergence_tol: 5e-4,
+            max_adaptive_iters: 12,
+            patience: 2,
+            ..AdaptiveSettings::default()
+        });
+        let run =
+            kmeans_train_with_restarts(&points, &config, &mut rng).expect("adaptive training");
+        assert_eq!(run.model.centroids.nrows(), 6);
+        assert!(run.telemetry.is_some());
+        let telemetry = run.telemetry.as_ref().unwrap();
+        assert_eq!(telemetry.mode, TrainingMode::Adaptive);
+        assert!(telemetry.adaptive.as_ref().unwrap().stage2_total_updates > 0);
     }
 }

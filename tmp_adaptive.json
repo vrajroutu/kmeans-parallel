@@ -1,0 +1,70 @@
+{
+  "k": 6,
+  "dim": 2,
+  "rows": 100000,
+  "iterations": 45,
+  "inertia": 3004.083507994584,
+  "converged": true,
+  "cluster_sizes": [
+    16954,
+    19512,
+    16648,
+    14719,
+    19298,
+    12869
+  ],
+  "init": "k-means-plus-plus",
+  "mode": "adaptive",
+  "seed": 42,
+  "elapsed_seconds": 0.051924917,
+  "standardized": false,
+  "config": {
+    "max_iter": 50,
+    "tol": 1e-6,
+    "n_init": 1
+  },
+  "centroids": [
+    [
+      0.731577184600483,
+      0.15799742360777683
+    ],
+    [
+      0.20433430476411127,
+      0.7782621422802638
+    ],
+    [
+      0.727463991846612,
+      0.8467855732827405
+    ],
+    [
+      0.4604846558925085,
+      0.4976362206437992
+    ],
+    [
+      0.20431412938364515,
+      0.21985962000626427
+    ],
+    [
+      0.8408809433882745,
+      0.5077217566853222
+    ]
+  ],
+  "data_source": {
+    "type": "synthetic",
+    "points": 100000,
+    "dim": 2
+  },
+  "assignments_path": "tmp_assign.csv",
+  "standardization": null,
+  "telemetry": {
+    "mode": "adaptive",
+    "adaptive": {
+      "reservoir_sample_size": 18,
+      "stage2_iterations": 4,
+      "stage2_last_batch_size": 20000,
+      "stage2_final_shift": 0.000042285552716125885,
+      "stage2_total_updates": 65000,
+      "stage3_iterations": 45
+    }
+  }
+}
