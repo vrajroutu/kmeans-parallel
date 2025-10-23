@@ -431,12 +431,15 @@ fn kmeans_pp_init(points: &DataMatrix, k: usize, rng: &mut ChaCha8Rng) -> Result
         }
         centroids.row_mut(cid).assign(&points.row(idx));
 
-        for i in 0..n {
-            let d = squared_distance(&points.row(i), &centroids.row(cid));
-            if d < distances[i] {
-                distances[i] = d;
-            }
-        }
+        distances
+            .iter_mut()
+            .zip(points.rows())
+            .for_each(|(dist_slot, row)| {
+                let d = squared_distance(&row, &centroids.row(cid));
+                if d < *dist_slot {
+                    *dist_slot = d;
+                }
+            });
     }
     Ok(centroids)
 }
@@ -562,11 +565,7 @@ impl DataLoader {
     pub fn load_parquet<P: AsRef<Path>>(path: P) -> Result<DataMatrix> {
         let file = File::open(path)?;
         let reader = SerializedFileReader::new(file)?;
-        let mut row_iter = reader.get_row_iter(None)?;
-        let mut rows: Vec<Row> = Vec::new();
-        while let Some(row) = row_iter.next() {
-            rows.push(row);
-        }
+        let rows: Vec<Row> = reader.get_row_iter(None)?.collect();
         if rows.is_empty() {
             return Ok(Array2::zeros((0, 0)));
         }

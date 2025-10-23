@@ -1,0 +1,92 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ "v*" ]
+  pull_request:
+    branches: [ main ]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quality:
+    name: Lint & Test
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: stable
+          override: true
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Cargo fetch
+        run: cargo fetch
+
+      - name: Build
+        run: cargo build --locked --verbose
+
+      - name: Run tests
+        run: cargo test --locked --verbose
+
+      - name: Run clippy
+        run: cargo clippy --locked -- -D warnings
+
+      - name: Run formatting check
+        run: cargo fmt -- --check
+
+      - name: Ensure benchmarks compile
+        run: cargo bench --no-run --bench bench_kmeans
+
+  release:
+    name: Publish Release
+    runs-on: macos-latest
+    needs: quality
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: stable
+          override: true
+
+      - name: Build optimized binary
+        run: cargo build --release --locked
+
+      - name: Package binaries
+        run: |
+          mkdir -p dist
+          cp target/release/kmeans-parallel-bin dist/kmeans-parallel-macos-universal
+          tar -czf dist/kmeans-parallel-macos-universal.tar.gz -C dist kmeans-parallel-macos-universal
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: kmeans-parallel-macos
+          path: dist/kmeans-parallel-macos-universal.tar.gz
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: dist/kmeans-parallel-macos-universal.tar.gz
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

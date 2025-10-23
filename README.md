@@ -1,10 +1,19 @@
 # kmeans-parallel
 
+[![Continuous Integration](https://github.com/vrajkishorerv/kmeans-parallel/actions/workflows/ci.yml/badge.svg)](https://github.com/vrajkishorerv/kmeans-parallel/actions/workflows/ci.yml)
+
 High-performance, parallelised k-means clustering implemented in Rust by **Vraj Routu**. The crate provides:
 
 - A reusable library with deterministic initialisation (`kmeans++` and random), restart handling, inertia tracking, cluster population metrics, and optional data standardisation helpers.
 - A CLI (`kmeans-parallel`) that can ingest CSV or Parquet datasets, generate synthetic data when no input is supplied, and emit rich JSON reports plus optional assignment CSVs.
 - Structured error handling and telemetry via `tracing`, making it straightforward to embed into larger observability pipelines.
+
+## Breakthrough Highlights
+
+- **Full-stack clustering toolkit** – same crate powers the CLI, library, release binaries, and multiple restarts with deterministic seeds.
+- **Production-grade ingestion** – native CSV and Parquet loaders with schema validation, z-score standardisation, and serde-friendly config.
+- **Observability-first design** – structured logging via `tracing`, diagnostic outputs (iterations, inertia, cluster sizes), and model persistence hooks.
+- **Automated delivery** – GitHub Actions pipeline gates every change with linting, tests, and bench compilation, then publishes signed release tarballs on `v*` tags.
 
 ## Features
 
@@ -74,3 +83,15 @@ cargo test
 ```
 
 The workspace requires access to crates.io for the first build to download dependencies.
+
+## Release Pipeline
+
+Tagged pushes matching `v*` trigger the CI workflow to build release binaries, attach them to GitHub Releases, and publish release notes automatically. To ship a new version:
+
+```bash
+cargo test && cargo bench --bench bench_kmeans
+git tag v0.2.0
+git push origin v0.2.0
+```
+
+Within minutes the macOS tarball appears on the release page ready for download. Continuous integration runs on every PR and push to `main`, ensuring the project stays production-ready.
